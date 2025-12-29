@@ -1,15 +1,14 @@
-
 export enum Subject {
-  MATH = 'Toán học',
-  PHYSICS = 'Vật lí',
-  CHEMISTRY = 'Hóa học',
-  DIARY = 'Nhật ký'
+  MATH = "Toán Học",
+  PHYSICS = "Vật Lý",
+  CHEMISTRY = "Hóa Học",
+  DIARY = "Nhật Ký"
 }
 
 export enum AgentType {
-  SPEED = 'Professor 1',
-  SOCRATIC = 'Professor 2',
-  PERPLEXITY = 'Professor 3',
+  SPEED = "Quét Ngay",
+  SOCRATIC = "Thông Suốt",
+  PERPLEXITY = "Chinh Phục"
 }
 
 export interface QuizQuestion {
