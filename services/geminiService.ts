@@ -1,79 +1,152 @@
-// File: src/services/geminiService.ts
+import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { Subject, AgentType } from "../types";
 
-/**
- * HÀM XỬ LÝ NHIỆM VỤ (SIÊU TÌM KIẾM KHÔNG API KEY)
- * Tự động điều hướng đến các nguồn học liệu tinh túy nhất Việt Nam
- */
-export const processTask = async (subject: Subject, agent: AgentType, input: string) => {
-  // 1. Định nghĩa "Siêu nguồn" tinh túy cho từng môn học
-  const sourceMap: Record<string, string> = {
-    [Subject.MATH]: "site:toanmath.com OR site:vungoi.vn OR site:loigiaihay.com OR site:hoc247.net",
-    [Subject.PHYSICS]: "site:thuvienvatly.com OR site:vietjack.com OR site:loigiaihay.com OR site:luyentap247.com",
-    [Subject.CHEMISTRY]: "site:hoc24.vn OR site:cunghocvui.com OR site:vietjack.com OR site:tudienphuongtrinh.com",
-    [Subject.DIARY]: "site:loigiaihay.com OR site:vietjack.com" // Mặc định cho các mục khác
-  };
+// CẤU HÌNH MODEL - Gemini 2.5 Flash cân toàn bộ để đạt tốc độ cao nhất
+const MODEL_CONFIG = {
+  TEXT: 'gemini-2.5-flash',
+  TTS: 'gemini-2.5-flash-tts', // Sử dụng model chuyên dụng cho Audio
+};
 
-  // Lấy danh sách site dựa trên môn học đã chọn, nếu không có thì dùng nguồn tổng hợp
-  const sources = sourceMap[subject] || "site:loigiaihay.com OR site:vietjack.com OR site:hoc24.vn";
-  
-  // 2. Kỹ thuật "Ép hiển thị" dữ liệu theo đặc thù của từng Chuyên gia
-  let searchModifier = "";
-  
-  switch (agent) {
-    case AgentType.SPEED:
-      // Chuyên gia 1: Tập trung lấy đáp án và con số cuối cùng
-      searchModifier = "đáp án kết quả cuối cùng ngắn gọn";
-      break;
-    case AgentType.SOCRATIC:
-      // Chuyên gia 2: Tập trung lấy các bước giải và phương pháp
-      searchModifier = "cách giải chi tiết từng bước một phương pháp";
-      break;
-    case AgentType.PERPLEXITY:
-      // Chuyên gia 3: Tìm các đề thi hoặc bài tập có dạng tương tự
-      searchModifier = "bài tập tương tự tự luyện có lời giải";
-      break;
-    default:
-      searchModifier = "lời giải chi tiết";
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+// CACHING LAYER
+const cache = new Map<string, string>();
+const audioCache = new Map<string, string>();
+
+const SYSTEM_PROMPTS: Record<string, string> = {
+  // Tab 1: Kết quả & Casio
+  [AgentType.SPEED]: `Bạn là chuyên gia giải toán siêu tốc. 
+    NHIỆM VỤ: Trả về JSON {"finalAnswer": "...", "casioSteps": "..."}.
+    - finalAnswer: Chỉ ghi đáp án cuối cùng (Dùng LaTeX). 
+    - casioSteps: Các bước bấm máy Casio 580VN X ngắn gọn nhất. Nếu không cần máy tính, ghi "Bài toán không cần bấm máy".`,
+
+  // Tab 2: Lời giải chi tiết
+  [AgentType.SOCRATIC]: `Bạn là giáo sư giảng bài.
+    NHIỆM VỤ: Giải chi tiết bài toán theo từng bước logic chặt chẽ. 
+    YÊU CẦU: Ngôn ngữ khoa học, dùng LaTeX cho mọi công thức. Không chào hỏi.`,
+
+  // Tab 3: Trắc nghiệm (Dễ & Khó)
+  [AgentType.PERPLEXITY]: `Bạn là chuyên gia ra đề thi. 
+    NHIỆM VỤ: Tạo 2 câu hỏi trắc nghiệm tương tự thi THPTQG.
+    - Câu 1: Mức độ Thông hiểu (Dễ).
+    - Câu 2: Mức độ Vận dụng (Khó).
+    Trả về định dạng JSON: {"quizzes": [{"question": "...", "options": ["A.", "B.", "C.", "D."], "answer": "A", "explanation": "..."}]}`
+};
+
+async function safeExecute<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: any) {
+    console.error("Gemini Service Error:", error);
+    throw new Error(error.toString().includes('429') ? "Hệ thống bận, hãy thử lại." : error.message);
   }
+}
 
-  // 3. Xây dựng câu lệnh tìm kiếm (Search Query)
-  // Sử dụng dấu ngoặc kép cho input để tăng độ chính xác lên 100%
-  const cleanInput = input.replace(/"/g, ''); // Loại bỏ ngoặc kép cũ nếu có
-  const finalQuery = `("${cleanInput}") ${searchModifier} ${sources}`;
+// 1. Hàm xử lý chung cho các Tab (Chạy song song ở App.tsx)
+export const processTask = async (subject: Subject, agent: AgentType, input: string, image?: string) => {
+  const cacheKey = `${subject}|${agent}|${input.substring(0, 50)}`;
+  if (cache.has(cacheKey)) return cache.get(cacheKey)!;
 
-  // 4. Mở Tab siêu tìm kiếm trên Google
-  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(finalQuery)}`;
-  
-  // Mở tab mới
-  const win = window.open(searchUrl, '_blank');
-  if (win) {
-    win.focus();
-  } else {
-    alert("Vui lòng cho phép trình duyệt mở Pop-up để xem lời giải!");
-  }
+  return safeExecute(async () => {
+    const prompt = `Môn: ${subject}. Nhiệm vụ: ${SYSTEM_PROMPTS[agent]}. Đề bài: ${input}`;
+    const parts: any[] = [{ text: prompt }];
+    if (image) parts.unshift({ inlineData: { mimeType: 'image/jpeg', data: image.split(',')[1] } });
 
-  // Trả về thông báo để hiển thị trên giao diện App
-  return `🚀 Hệ thống đã gửi yêu cầu tới các nguồn chuyên sâu môn ${subject}. 
-          Chuyên gia ${agent} đang hiển thị lời giải ở tab mới của bạn.`;
+    const response = await ai.models.generateContent({
+      model: MODEL_CONFIG.TEXT,
+      contents: { parts },
+      config: {
+        temperature: 0.1,
+        responseMimeType: agent !== AgentType.SOCRATIC ? "application/json" : "text/plain"
+      }
+    });
+
+    const resText = response.text || "";
+    cache.set(cacheKey, resText);
+    return resText;
+  });
 };
 
-/**
- * CÁC HÀM HỖ TRỢ (GIỮ NGUYÊN ĐỂ KHÔNG LỖI APP)
- */
-export const generateSimilarQuiz = async (answer: string) => {
-  return "Hệ thống đang trích xuất các câu hỏi luyện tập tương tự từ kho dữ liệu...";
+// 2. Hàm tạo câu hỏi trắc nghiệm nâng cao (Tab 3)
+export const generateSimilarQuiz = async (content: string) => {
+  // Vì Tab 3 đã tích hợp trong processTask (AgentType.PERPLEXITY), 
+  // hàm này có thể dùng để bổ trợ hoặc parse lại dữ liệu nếu cần.
+  return null; 
 };
 
-export const generateSummary = async (text: string) => {
-  return "Tóm tắt kiến thức trọng tâm dựa trên nguồn học liệu đã tìm kiếm.";
+// 3. Hàm tóm tắt để đọc (Audio Summary)
+export const generateSummary = async (content: string) => {
+  if (!content) return "";
+  return safeExecute(async () => {
+    const response = await ai.models.generateContent({
+      model: MODEL_CONFIG.TEXT,
+      contents: `Tóm tắt kết quả sau thành 1 câu nói cực ngắn để đọc (không đọc công thức phức tạp): ${content}`,
+    });
+    return response.text || "";
+  });
 };
 
+// 4. Hàm lấy Audio từ Gemini TTS (Chị Google chuẩn)
 export const fetchTTSAudio = async (text: string) => {
-  return "native-browser-tts"; // Chúng ta dùng Loa của trình duyệt trực tiếp trong App.tsx
+  if (!text) return undefined;
+  const cacheKey = `TTS|${text}`;
+  if (audioCache.has(cacheKey)) return audioCache.get(cacheKey);
+
+  return safeExecute(async () => {
+    const response = await ai.models.generateContent({
+      model: MODEL_CONFIG.TTS,
+      contents: [{ parts: [{ text }] }],
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: { 
+          voiceConfig: { 
+            prebuiltVoiceConfig: { voiceName: 'Puck' } // Giọng nữ Việt chuẩn (nếu model hỗ trợ) hoặc mặc định chất lượng cao
+          } 
+        },
+      },
+    });
+    const data = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (data) audioCache.set(cacheKey, data);
+    return data;
+  });
 };
 
-export const optimizeImage = async (base64Str: string) => {
-  // Không cần xử lý nén quá sâu vì không gửi đi API tốn phí
-  return base64Str;
+// 5. Trình phát Audio
+let globalAudioContext: AudioContext | null = null;
+let globalSource: AudioBufferSourceNode | null = null;
+
+export const playStoredAudio = async (base64Audio: string, audioSourceRef: React.MutableRefObject<AudioBufferSourceNode | null>) => {
+  if (!base64Audio) return;
+
+  if (globalSource) {
+    try { globalSource.stop(); } catch(e) {}
+    globalSource.disconnect();
+  }
+
+  if (!globalAudioContext) {
+    globalAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+  }
+  
+  if (globalAudioContext.state === 'suspended') await globalAudioContext.resume();
+
+  const audioData = atob(base64Audio);
+  const bytes = new Uint8Array(audioData.length);
+  for (let i = 0; i < audioData.length; i++) bytes[i] = audioData.charCodeAt(i);
+  
+  const dataInt16 = new Int16Array(bytes.buffer);
+  const buffer = globalAudioContext.createBuffer(1, dataInt16.length, 24000);
+  const channelData = buffer.getChannelData(0);
+  for (let i = 0; i < dataInt16.length; i++) channelData[i] = dataInt16[i] / 32768.0;
+
+  const source = globalAudioContext.createBufferSource();
+  source.buffer = buffer;
+  source.connect(globalAudioContext.destination);
+  
+  globalSource = source;
+  audioSourceRef.current = source;
+
+  return new Promise((resolve) => { 
+    source.onended = () => resolve(void 0); 
+    source.start(); 
+  });
 };
